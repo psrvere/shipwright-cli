@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	buildv1beta1 "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
@@ -17,6 +18,7 @@ import (
 	"github.com/shipwright-io/cli/pkg/shp/reactor"
 	"github.com/shipwright-io/cli/pkg/shp/streamer"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +32,7 @@ type UploadCommand struct {
 	follow       bool                       // flag to tail pod logs
 
 	buildRefName string // build name
+	buildRunName string // name of an existing BuildRun to stream into, instead of creating one
 	sourceDir    string // local directory to be streamed
 
 	dataStreamer    *streamer.Streamer // tar streamer instance
@@ -152,6 +155,42 @@ func (u *UploadCommand) Validate() error {
 	if !stat.IsDir() {
 		return fmt.Errorf("informed path is not a directory: '%s'", u.sourceDir)
 	}
+	if err := u.checkBuildRunNameConflicts(); err != nil {
+		return err
+	}
+	// streaming into an existing BuildRun only supports the local-copy path; a source bundle image
+	// requires this command to create the BuildRun and push the bundle itself.
+	if u.buildRunName != "" && u.sourceBundleImage != "" {
+		return fmt.Errorf("--%s is not supported for Builds using a source bundle image", flags.BuildrunNameFlag)
+	}
+	return nil
+}
+
+// checkBuildRunNameConflicts makes sure that, when an existing BuildRun is referenced with the
+// --buildrun-name flag, none of the flags that only apply to a BuildRun this command creates are
+// also set, since those settings would be silently ignored.
+func (u *UploadCommand) checkBuildRunNameConflicts() error {
+	if u.buildRunName == "" {
+		return nil
+	}
+	// flags that remain valid together with --buildrun-name
+	allowed := map[string]bool{
+		flags.BuildrunNameFlag: true,
+		flags.BuildrefNameFlag: true, // set programmatically from the positional argument
+		"follow":               true,
+	}
+	var conflicting []string
+	u.cmd.Flags().Visit(func(f *pflag.Flag) {
+		if !allowed[f.Name] {
+			conflicting = append(conflicting, "--"+f.Name)
+		}
+	})
+	if len(conflicting) > 0 {
+		return fmt.Errorf(
+			"--%s cannot be combined with %s; set those fields on the BuildRun you create instead",
+			flags.BuildrunNameFlag, strings.Join(conflicting, ", "),
+		)
+	}
 	return nil
 }
 
@@ -200,6 +239,28 @@ func (u *UploadCommand) createBuildRun(p *params.Params) (*buildv1beta1.BuildRun
 		return nil, err
 	}
 	fmt.Fprintf(u.ioStreams.Out, "BuildRun '%s' created!\n", br.GetName())
+	return br, nil
+}
+
+// resolveBuildRun returns the BuildRun to stream into: when --buildrun-name is set it fetches the
+// existing BuildRun, otherwise it creates a new one.
+func (u *UploadCommand) resolveBuildRun(p *params.Params) (*buildv1beta1.BuildRun, error) {
+	if u.buildRunName == "" {
+		return u.createBuildRun(p)
+	}
+
+	ns := p.Namespace()
+	clientset, err := p.ShipwrightClientSet()
+	if err != nil {
+		return nil, err
+	}
+	br, err := clientset.ShipwrightV1beta1().
+		BuildRuns(ns).
+		Get(u.cmd.Context(), u.buildRunName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(u.ioStreams.Out, "Streaming into existing BuildRun '%s/%s'...\n", ns, br.GetName())
 	return br, nil
 }
 
@@ -282,8 +343,8 @@ func (u *UploadCommand) onPodModifiedEventBundling(pod *corev1.Pod) error {
 // Run executes the primary business logic of this subcommand, by starting to watch over the build
 // pod status and react accordingly.
 func (u *UploadCommand) Run(p *params.Params, ioStreams *genericclioptions.IOStreams) error {
-	// creating a BuildRun with settings for the local source upload
-	br, err := u.createBuildRun(p)
+	// creating a BuildRun with settings for the local source upload, or resolving an existing one
+	br, err := u.resolveBuildRun(p)
 	if err != nil {
 		return err
 	}
@@ -340,5 +401,16 @@ func uploadCmd() runner.SubCommand {
 		follow:       false,
 	}
 	flags.FollowFlag(cmd.Flags(), &u.follow)
+	buildRunNameFlag(cmd.Flags(), &u.buildRunName)
 	return u
+}
+
+// buildRunNameFlag registers the --buildrun-name flag, storing the value on the informed pointer.
+func buildRunNameFlag(flagSet *pflag.FlagSet, buildRunName *string) {
+	flagSet.StringVar(
+		buildRunName,
+		flags.BuildrunNameFlag,
+		"",
+		"stream the local source into an existing BuildRun instead of creating one",
+	)
 }
